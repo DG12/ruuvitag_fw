@@ -1,5 +1,5 @@
 Based on version 2.5.9.<p>
-Miniun number of source files changes<p>
+Minimun number of source files changes<p>
 <li>Add tunables to main
 <li>Revised NFC report added tunable information in main. (DATA: was improperly coded)
 <li>Added app_error_fault_handler log message and blink 13 times.
