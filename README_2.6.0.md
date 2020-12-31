@@ -5,4 +5,4 @@ Minimun number of source files changes<p>
 <li>Added app_error_fault_handler log message and blink 13 times.
 <li>Transmit configuration packet ( x'C0') after initalization which includes tunable final values.
 
-See <a href=http://MyBeacons.info/tunable.html>MyBeacons.info/tunables</a> for details.
+See <a href=http://MyBeacons.info/tunables.html>MyBeacons.info/tunables</a> for details.
