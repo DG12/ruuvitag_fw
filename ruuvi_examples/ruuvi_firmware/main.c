@@ -1,13 +1,21 @@
-/** RuuviTag Environment-station  */
-// Version 2.4.3 March 03, 2019  add tuneables
-// Version 2.4.1 January 07, 2019 modes now  RAWv1(RED), RAWv2_FAST(GREEN) and RAWv2_SLOW(GREEN) preserved in flash. (URL removed)
+/** RuuviTag firmware  */
+// Version 2.5.9 +DG12 no comments since 2.5.3
+//               Add dateCompiled to NFC,
+//               DG12-tunableitems.c
+//               DG12-init.c  blink version, log version, , send C0nfig packets, 
+//               DG12-fault.c app_error_fault_handler blink 13
+//
+// Version 2.5.3 August 29, 2019. Send valid data from LIS2DH12 / BME280 even if only one is present. 
+// Version 2.5.2 August 15, 2019. Add invalid values to encoded data when real data is not available
+// Version 2.5.1 July 15, 2019. Start up in RAWv2-fast mode, use apple guidelines for advertising rates. 
+// Version 2.4.1 January 07, 2019 modes now  RAWv1(RED), RAWv2_FAST(GREEN) and RAWv2_SLOW(GREEN) preserved in flash. (URL removed) 
 //               long button hold or NFC triggers reset.
 //               short button or NFC  triggers become_connectable i.e. fast_advertising  BUT
-//                 default is always non-connectable, non-scannable (see bluetooth_application_config.h)
+//               default is always non-connectable, non-scannable (see bluetooth_application_config.h) 
 //               accelerometer (lis2dh12) reewritten as pre STM
 //               Only get battery voltage from ADC after radio has been quiet
 // Version 2.2.3 August 01, 2018; 
-//  Rewrite initalization continue even if there are failures and announce failure status by may means
+//  Rewrite initalization continue even if there are failures and announce failure status by led
 
 /* Copyright (c) 2015 Nordic Semiconductor. All Rights Reserved. 
  * The information contained herein is property of Nordic Semiconductor ASA.
@@ -74,6 +82,7 @@ APP_TIMER_DEF(reset_timer_id);                 // Creates timer id for our progr
 static uint16_t init_status = 0;   // combined status of all initalizations.  Zero when all are complete if no errors occured.
 static uint8_t NFC_message[100];   // NFC message buffer has 4 records, up to 128 bytes each minus some overhead for NFC NDEF data keeping. 
 static size_t NFC_message_length = sizeof(NFC_message);
+static uint32_t NFC_message_size;
 #define LOG_FAILED_INIT             0x0002
 #define ACCELEROMETER_FAILED_INIT   0x0004
 #define TEMP_HUM_PRESS_FAILED_INIT  0x0008
@@ -84,7 +93,7 @@ static size_t NFC_message_length = sizeof(NFC_message);
 #define PIN_ENA_FAILED_INIT         0x0200
 #define ACCEL_INT_FAILED_INIT       0x0400
 #define ACC_INT_FAILED_INIT         0x0800
-#define BATTERY_MIN_V                 2600
+#define BATTERY_MIN_V                 2000  //!< Millivolts, this value should be high enough to not trigger error on a tag on a freezer
 #define BATTERY_FAILED_INIT         0x1000
 #define BUTTON_FAILED_INIT          0x2000
 #define BME_FAILED_INIT             0x4000
@@ -100,34 +109,30 @@ static size_t NFC_message_length = sizeof(NFC_message);
 #define GREEN_LED_OFF nrf_gpio_pin_set(LED_GREEN)
 
 static uint8_t data_buffer[RAWv2_DATA_LENGTH] = { 0 };
-static bool model_plus = false;          // Flag for sensors available
-static bool fast_advertising = true;     // Connectable mode
-static uint64_t fast_advertising_start = 0;  // Timestamp of when tag became connectable
-static uint64_t debounce = 0;        // Flag for avoiding double presses
-static uint16_t acceleration_events = 0; // Number of times accelerometer has triggered
-static volatile uint16_t vbat = 0; //Update in interrupt after radio activity.
-static uint64_t last_battery_measurement = 0; // Timestamp of VBat update.
-static ruuvi_sensor_t data;
-static uint8_t advertisement_delay = 0; //Random, static delay to reduce collisions.
+static bool bme280_available = false;          // Flag for sensors available
+static bool lis2dh12_available = false;        // Flag for sensors available
+static bool fast_advertising = true;           // Connectable mode
+static uint64_t fast_advertising_start = 0;    // Timestamp of when tag became connectable
+static uint64_t debounce = 0;                  // Flag for avoiding double presses
+static uint16_t acceleration_events = 0;       // Number of times accelerometer has triggered
+static volatile uint16_t vbat = 0;             // Update in interrupt after radio activity.
+static uint64_t last_battery_measurement = 0;  // Timestamp of VBat update.
+static volatile bool pressed = false;          // Debounce flag
 
-// tuneables retained in UICR
-static uint32_t password = 0; // if !0 tuneables are protected
-static uint16_t advertising_interval = ADVERTISING_INTERVAL_RAW;
-static uint16_t main_loop_interval   = MAIN_LOOP_INTERVAL_RAW;
-static uint16_t ble_tx_power         = BLE_TX_POWER;
-static uint16_t accel_sample_rate    = LIS2DH12_SAMPLERATE_RAWv1;
-static uint16_t accel_resolution     = LIS2DH12_RESOLUTION;
+#include "DG12-tunableItems.c"
 
 // Possible modes of the app
 #define RAWv1 0
 #define RAWv2_FAST 1
 #define RAWv2_SLOW 2
+#define DEFAULT_MODE RAWv2_FAST
 
 // Must be UINT32_T as flash storage operated in 4-byte chunks
 // Will get loaded from flash, this is default.
-static uint32_t tag_mode __attribute__ ((aligned (4))) = RAWv1;
+static uint32_t tag_mode __attribute__ ((aligned (4))) = DEFAULT_MODE;
 // Rates of advertising. These must match the tag mode enum.
-static const uint16_t advertising_rates[] = {
+//atic const uint16_t advertising_rates[] = {
+static       uint16_t advertising_rates[] = {  // not const as [1] may be updated from UICR in init
   ADVERTISING_INTERVAL_RAW,
   ADVERTISING_INTERVAL_RAW,
   ADVERTISING_INTERVAL_RAW_SLOW
@@ -148,8 +153,6 @@ static void main_timer_handler(void * p_context);
 void change_mode(void* data, uint16_t length)
 {
   app_timer_stop(main_timer_id);
-  if (model_plus)
-  {
     switch(tag_mode)
     {  
       case RAWv2_SLOW:
@@ -159,7 +162,8 @@ void change_mode(void* data, uint16_t length)
 
       case RAWv2_FAST:
         lis2dh12_set_sample_rate(LIS2DH12_SAMPLERATE_RAWv2);
-        app_timer_start(main_timer_id, APP_TIMER_TICKS(MAIN_LOOP_INTERVAL_RAW, RUUVITAG_APP_TIMER_PRESCALER), NULL);
+//      app_timer_start(main_timer_id, APP_TIMER_TICKS(MAIN_LOOP_INTERVAL_RAW, RUUVITAG_APP_TIMER_PRESCALER), NULL);
+        app_timer_start(main_timer_id, APP_TIMER_TICKS(main_loop_interval    , RUUVITAG_APP_TIMER_PRESCALER), NULL); // DG12 tunable
         break;
 
       case RAWv1:
@@ -169,9 +173,15 @@ void change_mode(void* data, uint16_t length)
         tag_mode = RAWv1;
         break;
     }
-    bluetooth_configure_advertising_interval(advertising_rates[tag_mode] + advertisement_delay);
-    bluetooth_apply_configuration();
+  if(fast_advertising)
+  {
+    bluetooth_configure_advertising_interval(ADVERTISING_INTERVAL_STARTUP);
   }
+  else
+  {
+    bluetooth_configure_advertising_interval(advertising_rates[tag_mode]);
+  }
+  bluetooth_apply_configuration();
   NRF_LOG_INFO("Updating to %d mode\r\n", (uint32_t) tag_mode);
   main_timer_handler(NULL);
 }
@@ -185,7 +195,7 @@ static void become_connectable(void* data, uint16_t length)
 {
   fast_advertising_start = millis();
   fast_advertising = true;
-  bluetooth_configure_advertising_interval(ADVERTISING_INTERVAL_STARTUP + advertisement_delay);
+  bluetooth_configure_advertising_interval(ADVERTISING_INTERVAL_STARTUP);
   bluetooth_configure_advertisement_type(STARTUP_ADVERTISEMENT_TYPE);
   bluetooth_apply_configuration();
 }
@@ -225,7 +235,14 @@ static void store_mode(void* data, uint16_t length)
  */
 static void reboot(void* p_context)
 {
-  NVIC_SystemReset();
+  // Reboot if we've not registered a button press, OR
+  // if we have registered a button press and the button is still pressed (debounce)
+  if(!pressed || (pressed && !(nrf_gpio_pin_read(BUTTON_1))))
+  {
+    NRF_LOG_WARNING("Rebooting\r\n")
+    NVIC_SystemReset();
+  }
+  pressed = false;
 }
 
 /**@brief Function for handling button events.
@@ -238,8 +255,7 @@ static void reboot(void* p_context)
  */
 ret_code_t button_press_handler(const ruuvi_standard_message_t message)
 {
-  // Avoid double presses
-  static bool pressed = false;
+  // Debounce
   if(false == message.payload[1] && ((millis() - debounce) > DEBOUNCE_THRESHOLD) && !pressed)
   {
     NRF_LOG_INFO("Button pressed\r\n");
@@ -262,8 +278,10 @@ ret_code_t button_press_handler(const ruuvi_standard_message_t message)
 
      // Update mode
      tag_mode++;
-     if(tag_mode > 2) { tag_mode = 0; }
+     if(tag_mode > sizeof(advertising_rates)/sizeof(advertising_rates[0])) { tag_mode = 0; }
      app_sched_event_put (&tag_mode, sizeof(&tag_mode), change_mode);
+
+     //Enter connectable mode if allowed by configuration.
      if(APP_GATT_PROFILE_ENABLED)
      {
        app_sched_event_put (NULL, 0, become_connectable);
@@ -283,7 +301,7 @@ ret_code_t button_press_handler(const ruuvi_standard_message_t message)
  */
 static void reinit_nfc(void* data, uint16_t length)
 {
-  init_nfc();
+   nfc_init(NFC_message,NFC_message_size);    //  Dont call the ruuvi init_nfc, it just adds a log message. DG12 2 places  failed??
 }
 
 /**@brief Function for handling NFC events.
@@ -295,7 +313,7 @@ void app_nfc_callback(void* p_context, nfc_t2t_event_t event, const uint8_t* p_d
   switch (event)
   {
     case NFC_T2T_EVENT_FIELD_ON:
-      // NFC activation causes tag to hang sometimes. Fix this by reseting tag after a delay on NFC read.
+      // NFC activation causes tag to hang sometimes. Fix this by resetting tag after a delay on NFC read.
       NRF_LOG_INFO("NFC Field detected \r\n");
       app_timer_start(reset_timer_id, APP_TIMER_TICKS(NFC_RESET_DELAY, RUUVITAG_APP_TIMER_PRESCALER), NULL);
       break;
@@ -346,35 +364,34 @@ static void main_sensor_task(void* p_data, uint16_t length)
   if (RAWv1 == tag_mode) { RED_LED_ON; }
   else { GREEN_LED_ON; }
 
-  int32_t  raw_t  = 0;
-  uint32_t raw_p = 0;
-  uint32_t raw_h = 0;
+  ruuvi_sensor_t data = { .accX = ACCELERATION_INVALID,
+                          .accY = ACCELERATION_INVALID,
+                          .accZ = ACCELERATION_INVALID,
+                          .humidity = HUMIDITY_INVALID,
+                          .pressure = PRESSURE_INVALID,
+                          .temperature = TEMPERATURE_INVALID,
+                          .vbat = vbat
+                        };
   lis2dh12_sensor_buffer_t buffer;
-  int32_t acc[3] = {0};
 
   if (fast_advertising && ((millis() - fast_advertising_start) > ADVERTISING_STARTUP_PERIOD))
   {
     fast_advertising = false;
     bluetooth_configure_advertisement_type(APPLICATION_ADVERTISEMENT_TYPE);
 
-    bluetooth_configure_advertising_interval(advertising_rates[tag_mode] + advertisement_delay);
+    bluetooth_configure_advertising_interval(advertising_rates[tag_mode]);
     bluetooth_apply_configuration();
   }
 
-  // If we have all the sensors.
-  if (model_plus)
+  if (bme280_available)
   {
     // Get raw environmental data.
     bme280_read_measurements();
-    raw_t = bme280_get_temperature();
-    raw_p = bme280_get_pressure();
-    raw_h = bme280_get_humidity();
-
-    // Get accelerometer data.
-    lis2dh12_read_samples(&buffer, 1);
-    acc[0] = buffer.sensor.x;
-    acc[1] = buffer.sensor.y;
-    acc[2] = buffer.sensor.z;
+    data.temperature = bme280_get_temperature();
+    data.temperature+= BME280t_adj;         // tunable adjustment DG12
+    data.pressure    = bme280_get_pressure();
+    data.humidity    = bme280_get_humidity();
+    data.humidity   += BME280h_adj;         // tunable adjustment DG12
   }
   // If only temperature sensor is present.
   else
@@ -382,29 +399,28 @@ static void main_sensor_task(void* p_data, uint16_t length)
     int32_t temp;                                        // variable to hold temp reading
     (void)sd_temp_get(&temp);                            // get new temperature
     temp *= 25;                                          // SD returns temp * 4. Ruuvi format expects temp * 100. 4*25 = 100.
-    raw_t = (int32_t) temp;
+    data.temperature = temp;
   }
 
-  // Embed data into structure for parsing.
-  parseSensorData(&data, raw_t, raw_p, raw_h, vbat, acc);
-  NRF_LOG_DEBUG("temperature: %d, pressure: %d, humidity: %d x: %d y: %d z: %d\r\n", raw_t, raw_p, raw_h, acc[0], acc[1], acc[2]);
-  NRF_LOG_DEBUG("VBAT: %d send %d \r\n", vbat, data.vbat);
-  // Prepare bytearray to broadcast.
-  bme280_data_t environmental;
-  environmental.temperature = raw_t;
-  environmental.humidity = raw_h;
-  environmental.pressure = raw_p;
+  if(lis2dh12_available)
+  {
+    // Get accelerometer data.
+    lis2dh12_read_samples(&buffer, 1);
+    data.accX = buffer.sensor.x;
+    data.accY = buffer.sensor.y;
+    data.accZ = buffer.sensor.z;
+  }
 
   switch(tag_mode)
   {
     case RAWv2_FAST:
     case RAWv2_SLOW:
-      encodeToRawFormat5(data_buffer, &environmental, &buffer.sensor, acceleration_events, vbat, ble_tx_power);
+      encodeToRawFormat5(data_buffer, &data, acceleration_events, BLE_TX_POWER);
       break;
     
     case RAWv1:
     default:
-      encodeToSensorDataFormat(data_buffer, &data);
+      encodeToRawFormat3(data_buffer, &data);
       break;
   }
 
@@ -477,7 +493,7 @@ int main(void)
   RED_LED_ON;
 
   if( init_log() ) { init_status |=LOG_FAILED_INIT; }
-  else { NRF_LOG_INFO("LOG initalized \r\n"); } // subsequent initalizations assume log is working
+  else { NRF_LOG_INFO("LOG initialized \r\n"); } // subsequent initializations assume log is working
 
   // start watchdog now in case program hangs up.
   // watchdog_default_handler logs error and resets the tag.
@@ -490,16 +506,31 @@ int main(void)
   if( vbat < BATTERY_MIN_V ) { init_status |=BATTERY_FAILED_INIT; }
   else NRF_LOG_INFO("BATTERY initalized \r\n"); 
 
-  if(init_sensors() == NRF_SUCCESS )
+  if(init_lis2dh12() == NRF_SUCCESS )
   {
-    model_plus = true;
-    NRF_LOG_INFO("Sensors initialized \r\n");  
+    lis2dh12_available = true;
+    NRF_LOG_INFO("Accelerometer initialized \r\n");  
   }
+  else { init_status |= ACC_INT_FAILED_INIT; }
+
+  if(init_bme280() == NRF_SUCCESS )
+  {
+    bme280_available = true;
+    NRF_LOG_INFO("BME initialized \r\n");  
+  } 
+  else { init_status |= TEMP_HUM_PRESS_FAILED_INIT; }
+
 
   // Init NFC ASAP in case we're waking from deep sleep via NFC (todo)
   // outputs ID:DEVICEID ,MAC:DEVICEADDR, SW:REVision
   set_nfc_callback(app_nfc_callback);
-  if( init_nfc() ) { init_status |= NFC_FAILED_INIT; } 
+
+#include "dateCompiled.h"                                                       // also used in DG12-init.c
+   char compiledDate[4] = { 0 }; memcpy(&(compiledDate[0]), &dateCompiled,4); // coordinate with .map and .out       //DG12
+  NFC_message_size=snprintf((char* )NFC_message, NFC_message_length, 
+                                           "%c%c%c%c",                      // stored in 02X
+                                            compiledDate[3],compiledDate[2],compiledDate[1],compiledDate[0]); // %M%H%d%m 
+  if( nfc_init(NFC_message,NFC_message_size)) { init_status |= NFC_FAILED_INIT; NRF_LOG_WARNING("NFC init fail \r\n"); }  // DG12
   else { NRF_LOG_INFO("NFC init \r\n"); }
 
   pin_interrupt_init(); 
@@ -509,9 +540,14 @@ int main(void)
     init_status |= BUTTON_FAILED_INIT;
   }
 
+nrf_delay_ms(500u);             
+    GREEN_LED_ON;
+  NRF_LOG_INFO("BLE next \r\n");                                                    // DG12
   // Initialize BLE Stack. Starts LFCLK required for timer operation.
   if( init_ble() ) { init_status |= BLE_FAILED_INIT; }
-  advertisement_delay = NRF_FICR->DEVICEID[0]&0x0F;
+  bluetooth_configure_advertisement_type(STARTUP_ADVERTISEMENT_TYPE);
+  bluetooth_tx_power_set(BLE_TX_POWER);
+  bluetooth_configure_advertising_interval(ADVERTISING_INTERVAL_STARTUP);
 
   // Priorities 2 and 3 are after SD timing critical events. 
   // 6, 7 after SD non-critical events.
@@ -519,6 +555,7 @@ int main(void)
   ble_radio_notification_init(3,
                               NRF_RADIO_NOTIFICATION_DISTANCE_800US,
                               on_radio_evt);
+  NRF_LOG_INFO("BLE init \r\n");                                                    // DG12
 
   // If GATT is enabled BLE init inits peer manager which uses flash.
   // BLE init should handle insufficient space gracefully (i.e. erase flash and proceed). 
@@ -546,27 +583,11 @@ int main(void)
     NRF_LOG_INFO("Loaded mode %d from flash\r\n", tag_mode);
   }
 
-  // Enter stored mode after boot - or default mode if store mode was not found
-  app_sched_event_put (&tag_mode, sizeof(&tag_mode), change_mode);
-  
-  // Initialize repeated timer for sensor read and single-shot timer for button reset
-  if( init_timer(main_timer_id, APP_TIMER_MODE_REPEATED, main_loop_interval, main_timer_handler) )
-  {
-    init_status |= TIMER_FAILED_INIT;
-  }
-  
-  if( init_timer(reset_timer_id, APP_TIMER_MODE_SINGLE_SHOT, BUTTON_RESET_TIME, reboot) )
-  {
-    init_status |= TIMER_FAILED_INIT;
-  }
-  // Init starts timers, stop the reset
-  app_timer_stop(reset_timer_id);
-
   if( init_rtc() ) { init_status |= RTC_FAILED_INIT; }
   else { NRF_LOG_INFO("RTC initialized \r\n"); }
 
-  // Initialize lis2dh12 and BME280 - TODO: Differentiate LIS2DH12 and BME280 
-  if (model_plus)    
+  // Configure lis2dh12
+  if (lis2dh12_available)    
   {
     lis2dh12_reset(); // Clear memory.
     
@@ -580,12 +601,14 @@ int main(void)
     // Enable XYZ axes.
     lis2dh12_enable();
     lis2dh12_set_scale(LIS2DH12_SCALE);
-    lis2dh12_set_sample_rate(accel_sample_rate);
-    lis2dh12_set_resolution(accel_resolution);
+    lis2dh12_set_sample_rate(LIS2DH12_SAMPLERATE_RAWv1);
+    lis2dh12_set_resolution(LIS2DH12_RESOLUTION);
 
     lis2dh12_set_activity_interrupt_pin_2(LIS2DH12_ACTIVITY_THRESHOLD);
     NRF_LOG_INFO("Accelerometer configuration done \r\n");
-
+  }
+  if(bme280_available)
+  {
     // oversampling must be set for each used sensor.
     bme280_set_oversampling_hum  (BME280_HUMIDITY_OVERSAMPLING);
     bme280_set_oversampling_temp (BME280_TEMPERATURE_OVERSAMPLING);
@@ -596,11 +619,28 @@ int main(void)
     NRF_LOG_INFO("BME280 configuration done \r\n");
   }
 
+  // Enter stored mode after boot - or default mode if store mode was not found
+  app_sched_event_put (&tag_mode, sizeof(&tag_mode), change_mode);
+  
+  // Initialize repeated timer for sensor read and single-shot timer for button reset
+//if( init_timer(main_timer_id, APP_TIMER_MODE_REPEATED, MAIN_LOOP_INTERVAL_RAW, main_timer_handler) )
+  if( init_timer(main_timer_id, APP_TIMER_MODE_REPEATED, main_loop_interval    , main_timer_handler) ) //   DG12 tunable
+  {
+    init_status |= TIMER_FAILED_INIT;
+  }
+  
+  if( init_timer(reset_timer_id, APP_TIMER_MODE_SINGLE_SHOT, BUTTON_RESET_TIME, reboot) )
+  {
+    init_status |= TIMER_FAILED_INIT;
+  }
+  // Init starts timers, stop the reset
+  app_timer_stop(reset_timer_id);
+
   // Log errors, add a note to NFC, blink RED to visually indicate the problem
-  if (init_status )
+  if (init_status)
   { 
-    snprintf((char* )NFC_message, NFC_message_length, "Error: %X", init_status);
-    NRF_LOG_WARNING (" -- Initalization error :  %X \r\n", init_status);
+    snprintf((char* )NFC_message, NFC_message_length, "Error: %X", init_status);     // DG12 but never sent to NFC ?
+    NRF_LOG_WARNING (" -- Initialization error :  %X \r\n", init_status);
     for ( int16_t i=0; i<13; i++)
     { 
       RED_LED_ON;
@@ -612,24 +652,26 @@ int main(void)
   
   // Turn green led on if model+ with no errors.
   // Power manage turns led off
-  if (model_plus & !init_status)
+  if (!init_status)
   {
     GREEN_LED_ON;
   }
 
   // Turn off red led, leave green on to signal model+ without errors
   RED_LED_OFF;
-  nrf_delay_ms(500);
+
+#include "DG12-init.c"
+
+// Wait for sensors to take first sample
+  nrf_delay_ms(1000);
+  // Get first sample from sensors, set fast advertising start counter
+  fast_advertising_start = millis();
   app_sched_event_put (NULL, 0, main_sensor_task);
   app_sched_execute();
 
-  // 
-  bluetooth_configure_advertisement_type(STARTUP_ADVERTISEMENT_TYPE);
-  bluetooth_tx_power_set(ble_tx_power);
-  bluetooth_configure_advertising_interval(advertising_interval);
+  // Start advertising 
   bluetooth_advertising_start(); 
   NRF_LOG_INFO("Advertising started\r\n");
-  password=password; // just to make compiler happy
 
   // Enter main loop. Executes tasks scheduled by timers and interrupts.
   for (;;)
@@ -639,3 +681,4 @@ int main(void)
     power_manage();
   }
 }
+#include "DG12-fault.c"
